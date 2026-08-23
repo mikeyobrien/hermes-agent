@@ -606,11 +606,17 @@ async def get_session_messages(
     offset: int = Query(0, ge=0),
     order: Optional[str] = Query(None),
     include_compacted: bool = Query(False),
+    before_id: Optional[int] = Query(None, ge=1),
 ):
     if order not in (None, "oldest", "latest"):
         raise HTTPException(
             status_code=400,
             detail="order must be one of: oldest, latest",
+        )
+    if before_id is not None and order == "latest":
+        raise HTTPException(
+            status_code=400,
+            detail="before_id is incompatible with order=latest",
         )
 
     def _read():
@@ -634,6 +640,7 @@ async def get_session_messages(
                 offset=offset,
                 latest=latest_page,
                 include_compacted=include_compacted,
+                before_id=before_id,
             )
         finally:
             db.close()
@@ -642,6 +649,17 @@ async def get_session_messages(
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
     sid, _limit, messages = result
+
+    # Compute has_more / next_before_id when using before_id cursor.
+    has_more = False
+    next_before_id = None
+    if before_id is not None and messages:
+        # messages are returned in chronological (ascending id) order.
+        # The oldest message in this page is the lower bound for the next page.
+        next_before_id = messages[0].get("id")
+        # has_more is True when we hit the limit (there may be more older messages).
+        has_more = len(messages) == _limit
+
     return {
         "session_id": sid,
         "messages": messages,
@@ -650,6 +668,8 @@ async def get_session_messages(
             "offset": offset,
             "order": order or ("latest" if limit is None else "oldest"),
             "returned": len(messages),
+            "has_more": has_more if before_id is not None else None,
+            "next_before_id": next_before_id,
         },
     }
 

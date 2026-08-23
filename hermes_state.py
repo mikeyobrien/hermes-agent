@@ -10760,6 +10760,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         offset: int = 0,
         latest: bool = False,
         after_id: Optional[int] = None,
+        before_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -10791,11 +10792,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``after_id`` enables keyset pagination (``id > after_id``): O(1)
         page seeks on huge transcripts where OFFSET degrades to O(n) per
         page. Ascending order only (incompatible with ``latest``/``offset``).
+
+        ``before_id`` enables the reverse keyset pagination (``id < before_id``):
+        O(1) seeks for scrolling older. The result is returned in chronological
+        (ascending id) order so callers can append. Incompatible with
+        ``after_id``, ``latest``, and ``offset``.
         """
         if after_id is not None and (latest or offset):
             raise ValueError("after_id is incompatible with latest/offset paging")
         if after_id is not None and include_compacted:
             raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
+        if before_id is not None and (after_id or latest or offset):
+            raise ValueError("before_id is incompatible with after_id/latest/offset paging")
+        if before_id is not None and include_compacted:
+            raise ValueError("before_id is incompatible with include_compacted")
         if include_inactive:
             # Audit / debug reads: every row, including soft-deleted.
             active_clause = ""
@@ -10807,13 +10817,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         else:
             active_clause = " AND active = 1"
         keyset_clause = " AND id > ?" if after_id is not None else ""
+        before_id_clause = " AND id < ?" if before_id is not None else ""
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
+            f"{active_clause}{keyset_clause}{before_id_clause} ORDER BY id "
+            f"{'DESC' if (latest or before_id is not None) else 'ASC'}"
         )
         params: list = [session_id]
         if after_id is not None:
             params.append(after_id)
+        if before_id is not None:
+            params.append(before_id)
         if include_compacted:
             # Compaction epochs copy the protected tail into each new
             # generation, so the same logical message can exist as several
@@ -10848,22 +10862,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
                     seen[key] = row
             rows = sorted(seen.values(), key=lambda r: r["id"])
-            if latest:
+            if latest or before_id is not None:
                 rows = rows[::-1]
+            # Filter to before_id cursor before pagination
+            if before_id is not None:
+                rows = [r for r in rows if r["id"] < before_id]
             rows = rows[offset:]
             if limit is not None:
                 rows = rows[:limit]
-            if latest:
+            if latest or before_id is not None:
                 rows = rows[::-1]
         else:
             if limit is not None or offset:
                 # SQLite's OFFSET requires LIMIT; -1 means "no limit".
                 sql += " LIMIT ? OFFSET ?"
                 params.extend([-1 if limit is None else limit, offset])
+            elif before_id is not None:
+                # before_id needs an explicit cap; use the same default as the endpoint.
+                sql += " LIMIT ?"
+                params.append(500)
             with self._read_ctx() as conn:
                 cursor = conn.execute(sql, params)
                 rows = cursor.fetchall()
-            if latest:
+            if latest or before_id is not None:
                 rows.reverse()
         result = []
         for row in rows:
