@@ -795,12 +795,15 @@ All commands are also available as a slash command in the interactive CLI and in
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
+| `kanban.require_workspace_push` | `false` | **Commit-before-done gate.** When `true`, a task whose workspace is a `dir` workspace (a shared directory, not a kernel-managed scratch dir or worktree) **cannot be marked done** while it has commits not pushed to its upstream ref, or tracked files left modified/staged/deleted. The refused completion emits a `completion_blocked_unpushed` event (workspace path, unpushed count, dirty flag) and leaves the task's state untouched, so the worker can push and retry. State that can't be verified — no upstream, detached HEAD, not a repo, probe timeout — never blocks ("can't verify" ≠ "dirty"). Untracked files (`??`) do not count as dirt. Set it in every profile config that runs dir-workspace workers (workers read their own profile's `config.yaml`), e.g. the profile that completes cards on repos you want pushed-on-done. |
 
 ```yaml
 kanban:
   max_in_progress: 2
   auto_promote_children: false
   default_workdir: ~/work/active-project
+  require_workspace_push: true     # block completion of dir-workspace tasks
+                                   # with unpushed commits or tracked dirt
 ```
 
 ### Scheduled task starts (`scheduled_at`)

@@ -5378,6 +5378,115 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+# Bound for the git probes in _check_workspace_push_state. Two probes
+# (unpushed count + dirty status) x this cap keeps a pathological
+# workspace (network-backed git dir, hung fs) from stalling completion
+# for more than ~2s worst case.
+_WORKSPACE_PUSH_PROBE_TIMEOUT_S = 5
+
+
+def _require_workspace_push_enabled() -> bool:
+    """Whether the workspace-push completion gate is active.
+
+    Resolution order:
+    1. ``HERMES_KANBAN_REQUIRE_PUSH`` env override — an explicit falsy
+       value (``0``/``false``/``no``/``off``, case-insensitive) forces the
+       gate OFF (emergency bypass). Any other non-empty value (including
+       a bare ``1``/``true``) forces it ON, so the override works even on
+       a profile whose config.yaml lacks the key.
+    2. ``kanban.require_workspace_push`` from config, default False. The
+       config is the completing process's own (workers run with their
+       profile's HERMES_HOME, so they read their profile's config — same
+       semantics as the ``dispatch_in_gateway`` probe in hermes_cli/kanban.py).
+
+    Fail-open: any error reading config (unreadable file, missing
+    hermes_cli.config in a stripped environment, ...) disables the gate.
+    The gate is a durability guard, not a data path — never let it
+    crash a completion because of config plumbing.
+    """
+    raw = os.environ.get("HERMES_KANBAN_REQUIRE_PUSH", "").strip()
+    if raw:
+        if raw.lower() in ("0", "false", "no", "off"):
+            return False
+        return True
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+        return bool(cfg.get("kanban", {}).get("require_workspace_push", False))
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _check_workspace_push_state(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Audit a task's ``dir`` workspace for unpushed commits / tracked dirt.
+
+    Returns ``None`` when completion should proceed (or the state can't
+    be verified — no-upstream, detached HEAD, not a repo, probe timeout;
+    "can't verify" must never block work), or a dict describing why it
+    must be refused::
+
+        {"workspace": str, "unpushed": int, "dirty": bool}
+
+    Untracked files (``??``) are deliberately NOT treated as dirt: they
+    are never part of what was committed, so they are not what a
+    commit-before-done gate is protecting. Tracked modifications,
+    staged changes, and deletions (any non-``??`` porcelain line) are.
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["workspace_kind"] != "dir" or not row["workspace_path"]:
+        return None
+    workspace = row["workspace_path"]
+
+    env = dict(os.environ)
+    # Never let an interactive credential prompt or a slow pager hang the
+    # probe; these are read-only local-state questions.
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_PAGER"] = "cat"
+
+    def _git(args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", workspace, *args],
+            capture_output=True,
+            text=True,
+            timeout=_WORKSPACE_PUSH_PROBE_TIMEOUT_S,
+            env=env,
+        )
+
+    # (a) Unpushed commits: rev-list count against the upstream ref.
+    # rc != 0 covers no-upstream ("fatal: no upstream"), detached HEAD,
+    # and not-a-repo; a non-integral stdout covers the rest. Any
+    # verification failure means "don't block".
+    unpushed: int = 0
+    try:
+        proc = _git(["rev-list", "--count", "@{u}..HEAD"])
+        if proc.returncode == 0:
+            try:
+                unpushed = max(0, int(proc.stdout.strip()))
+            except ValueError:
+                unpushed = 0
+    except (subprocess.TimeoutExpired, OSError):
+        unpushed = 0
+
+    # (b) Tracked dirt: porcelain status, ignoring untracked (??) rows.
+    dirty = False
+    try:
+        proc = _git(["status", "--porcelain"])
+        if proc.returncode == 0:
+            dirty = any(
+                line and not line.startswith("??")
+                for line in proc.stdout.splitlines()
+            )
+    except (subprocess.TimeoutExpired, OSError):
+        dirty = False
+
+    if unpushed > 0 or dirty:
+        return {"workspace": workspace, "unpushed": unpushed, "dirty": dirty}
+    return None
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5453,6 +5562,34 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate: workspace push state, before the main write txn. A 'dir'
+    # workspace with unpushed commits (or tracked dirt) must not be
+    # markable done — that is exactly how cards get "completed" with work
+    # stranded on local main and silently demoted afterwards. Gated on
+    # kanban.require_workspace_push (default false) with an
+    # HERMES_KANBAN_REQUIRE_PUSH env override; "can't verify" (no
+    # upstream, detached, not a repo, probe failure) never blocks. A
+    # rejected completion gets an auditable event and returns False with
+    # no state mutation, mirroring the created_cards gate above.
+    if _require_workspace_push_enabled():
+        ws_state = _check_workspace_push_state(conn, task_id)
+        if ws_state is not None:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_unpushed",
+                    {
+                        "workspace": ws_state["workspace"],
+                        "unpushed": ws_state["unpushed"],
+                        "dirty": ws_state["dirty"],
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result)
+                            else None
+                        ),
+                    },
+                )
+            return False
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,

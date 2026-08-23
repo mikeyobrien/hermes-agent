@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -1192,6 +1193,208 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Workspace-push gate (commit-before-done, kanban.require_workspace_push)
+# ---------------------------------------------------------------------------
+
+
+def _git_run(cwd, *args):
+    """Run a git command in ``cwd`` and return the CompletedProcess."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+
+
+def _make_git_repo(base: Path, name: str = "ws") -> tuple[Path, Path]:
+    """Create (remote, workdir) — a bare remote + a clone with upstream set.
+
+    ``workdir`` has an upstream (its origin) so ``@{u}`` resolves; the
+    initial commit is already pushed, so the clone starts in a clean,
+    fully-pushed state that tests can perturb from.
+    """
+    remote = base / f"{name}-remote.git"
+    workdir = base / name
+    _git_run(base, "init", "--bare", str(remote))
+    _git_run(base, "clone", str(remote), str(workdir))
+    (workdir / "base.txt").write_text("base\n")
+    _git_run(workdir, "add", "base.txt")
+    _git_run(workdir, "commit", "-m", "initial")
+    # Push with -u so the local branch has an upstream and @{u} resolves.
+    _git_run(workdir, "push", "-u", "origin", "HEAD")
+    return remote, workdir
+
+
+def _blocked_event(conn, task_id: str):
+    """Return the completion_blocked_unpushed event payload (or None)."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='completion_blocked_unpushed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return json.loads(row["payload"]) if row else None
+
+
+def test_push_gate_blocks_unpushed_dir_workspace(kanban_home, monkeypatch):
+    """dir workspace with unpushed commit -> completion refused, no state
+    mutation, auditable event with workspace path + count + dirty flag."""
+    monkeypatch.setenv("HERMES_KANBAN_REQUIRE_PUSH", "1")
+    base = Path(kanban_home) / "repos"
+    base.mkdir()
+    _remote, workdir = _make_git_repo(base)
+    (workdir / "work.txt").write_text("work\n")
+    _git_run(workdir, "add", "work.txt")
+    _git_run(workdir, "commit", "-m", "unpushed work")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="unpushed", assignee="w",
+            workspace_kind="dir", workspace_path=str(workdir),
+        )
+        kb.claim_task(conn, tid)
+        ok = kb.complete_task(conn, tid, summary="should not land")
+        assert ok is False
+        assert kb.get_task(conn, tid).status == "running"
+        ev = _blocked_event(conn, tid)
+        assert ev is not None
+        assert ev["workspace"] == str(workdir)
+        assert ev["unpushed"] == 1
+        assert ev["dirty"] is False
+    finally:
+        conn.close()
+
+
+def test_push_gate_allows_pushed_clean_dir_workspace(kanban_home, monkeypatch):
+    """dir workspace that is pushed and clean -> completion proceeds."""
+    monkeypatch.setenv("HERMES_KANBAN_REQUIRE_PUSH", "1")
+    base = Path(kanban_home) / "repos"
+    base.mkdir()
+    _remote, workdir = _make_git_repo(base, name="clean")
+    # A second, already-pushed commit: still clean, still pushed.
+    (workdir / "more.txt").write_text("more\n")
+    _git_run(workdir, "add", "more.txt")
+    _git_run(workdir, "commit", "-m", "pushed work")
+    _git_run(workdir, "push")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="clean", assignee="w",
+            workspace_kind="dir", workspace_path=str(workdir),
+        )
+        kb.claim_task(conn, tid)
+        ok = kb.complete_task(conn, tid, summary="pushed clean")
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "done"
+        assert _blocked_event(conn, tid) is None
+    finally:
+        conn.close()
+
+
+def test_push_gate_disabled_by_default(kanban_home, monkeypatch):
+    """Config off (default) -> gate never blocks, even with unpushed
+    commits in a dir workspace."""
+    monkeypatch.delenv("HERMES_KANBAN_REQUIRE_PUSH", raising=False)
+    base = Path(kanban_home) / "repos"
+    base.mkdir()
+    _remote, workdir = _make_git_repo(base, name="off")
+    (workdir / "work.txt").write_text("work\n")
+    _git_run(workdir, "add", "work.txt")
+    _git_run(workdir, "commit", "-m", "unpushed work")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="gate-off", assignee="w",
+            workspace_kind="dir", workspace_path=str(workdir),
+        )
+        kb.claim_task(conn, tid)
+        ok = kb.complete_task(conn, tid, summary="lands despite unpushed")
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "done"
+        assert _blocked_event(conn, tid) is None
+    finally:
+        conn.close()
+
+
+def test_push_gate_blocks_dirty_tracked_tree(kanban_home, monkeypatch):
+    """dir workspace with tracked modifications (clean push state) ->
+    completion refused; event carries dirty=True. Untracked files must
+    NOT count as dirt."""
+    monkeypatch.setenv("HERMES_KANBAN_REQUIRE_PUSH", "1")
+    base = Path(kanban_home) / "repos"
+    base.mkdir()
+    _remote, workdir = _make_git_repo(base, name="dirty")
+    # Pushed state is clean, but a tracked file is modified.
+    (workdir / "base.txt").write_text("base MODIFIED\n")
+    # Untracked file alongside: must not trigger the gate on its own.
+    (workdir / "scratch.txt").write_text("scratch\n")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="dirty", assignee="w",
+            workspace_kind="dir", workspace_path=str(workdir),
+        )
+        kb.claim_task(conn, tid)
+        ok = kb.complete_task(conn, tid, summary="should not land")
+        assert ok is False
+        assert kb.get_task(conn, tid).status == "running"
+        ev = _blocked_event(conn, tid)
+        assert ev is not None
+        assert ev["unpushed"] == 0
+        assert ev["dirty"] is True
+    finally:
+        conn.close()
+
+
+def test_push_gate_allows_unverifiable_upstream(kanban_home, monkeypatch):
+    """No-upstream and detached-HEAD state can't be verified -> the gate
+    must NOT block ("can't verify" != "dirty")."""
+    monkeypatch.setenv("HERMES_KANBAN_REQUIRE_PUSH", "1")
+    base = Path(kanban_home) / "repos"
+    base.mkdir()
+    # Repo with a commit but NO upstream configured.
+    _remote, workdir = _make_git_repo(base, name="noupstream")
+    _git_run(workdir, "branch", "--unset-upstream")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="no-upstream", assignee="w",
+            workspace_kind="dir", workspace_path=str(workdir),
+        )
+        kb.claim_task(conn, tid)
+        ok = kb.complete_task(conn, tid, summary="verifiable-ish")
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "done"
+        assert _blocked_event(conn, tid) is None
+
+        # Detached HEAD, clean tree, pushed commit — also unverifiable.
+        head = _git_run(workdir, "rev-parse", "HEAD").stdout.strip()
+        _git_run(workdir, "checkout", "--detach", head)
+        tid2 = kb.create_task(
+            conn, title="detached", assignee="w",
+            workspace_kind="dir", workspace_path=str(workdir),
+        )
+        kb.claim_task(conn, tid2)
+        ok2 = kb.complete_task(conn, tid2, summary="detached is fine")
+        assert ok2 is True
+        assert kb.get_task(conn, tid2).status == "done"
+        assert _blocked_event(conn, tid2) is None
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
