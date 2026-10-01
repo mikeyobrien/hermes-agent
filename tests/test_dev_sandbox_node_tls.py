@@ -1,4 +1,4 @@
-"""Exercise sandbox CA wiring with real npm, TLS, and the fixture proxy.
+"""Exercise sandbox Node configuration with real npm, TLS, and the fixture proxy.
 
 Only bubblewrap is replaced: its emitted environment is applied to the real
 installer's node-deps stage, so these tests need no privileged namespaces or
@@ -25,6 +25,93 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ASSETS = REPO_ROOT / "scripts" / "sandbox"
 pytestmark = pytest.mark.linux_only
+
+
+def _write_bwrap(bin_dir: Path) -> None:
+    bwrap = bin_dir / "bwrap"
+    bwrap.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "print(json.dumps({args[i+1]: args[i+2] for i, arg in enumerate(args) "
+        "if arg == '--setenv'}))\n",
+        encoding="utf-8",
+    )
+    bwrap.chmod(0o755)
+
+
+@pytest.mark.parametrize("header_dir", [None, "/nix/store/test-node-headers"])
+def test_sandbox_only_pins_explicit_node_headers(tmp_path: Path, header_dir) -> None:
+    """Run both setup stages; replace only the unavailable namespace tools."""
+    for command in ("git", "node", "openssl"):
+        if shutil.which(command) is None:
+            pytest.skip(f"requires {command}")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / ".gitignore").write_text(".hermes-sandbox/\n", encoding="utf-8")
+    for arguments in (
+        ["init", "-q"],
+        ["add", ".gitignore"],
+        [
+            "-c",
+            "user.name=Sandbox test",
+            "-c",
+            "user.email=test@invalid",
+            "commit",
+            "-qm",
+            "test fixture",
+        ],
+    ):
+        subprocess.run(["git", "-C", str(source), *arguments], check=True, timeout=10)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # A conventional host Node prefix must not become a node-gyp override.
+    (bin_dir / "node").symlink_to(shutil.which("node"))
+    _write_bwrap(bin_dir)
+    shims = {
+        "unshare": ('#!/bin/bash\nwhile [[ $1 == --* ]]; do shift; done\nexec "$@"\n'),
+        "slirp4netns": (
+            "#!/usr/bin/env python3\n"
+            "import os, time\n"
+            "os.write(3, b'1')\n"
+            "while True: time.sleep(1)\n"
+        ),
+    }
+    for command, contents in shims.items():
+        path = bin_dir / command
+        path.write_text(contents, encoding="utf-8")
+        path.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HERMES_SANDBOX_SOURCE_ROOT": str(source),
+        "DEV_SANDBOX_ASSETS": str(ASSETS),
+    }
+    environment.pop("DEV_SANDBOX_NODE_DIR", None)
+    if header_dir is not None:
+        environment["DEV_SANDBOX_NODE_DIR"] = header_dir
+    result = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts" / "dev-sandbox.sh"),
+            "--persistent",
+            "--root",
+            "--",
+            "true",
+        ],
+        cwd=source,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload_environment = json.loads(result.stdout)
+    if header_dir is None:
+        assert "npm_config_nodedir" not in payload_environment
+    else:
+        assert payload_environment["npm_config_nodedir"] == header_dir
 
 
 def _make_ca(directory: Path) -> None:
@@ -62,16 +149,7 @@ def _stage2_environment(tmp_path: Path, certs: Path) -> dict[str, str]:
     (root / "root" / "logs" / "slirp.ready").write_text("1", encoding="utf-8")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    bwrap = bin_dir / "bwrap"
-    bwrap.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, sys\n"
-        "args = sys.argv[1:]\n"
-        "print(json.dumps({args[i+1]: args[i+2] for i, arg in enumerate(args) "
-        "if arg == '--setenv'}))\n",
-        encoding="utf-8",
-    )
-    bwrap.chmod(0o755)
+    _write_bwrap(bin_dir)
     result = subprocess.run(
         ["bash", str(ASSETS / "stage2-run.sh"), "true"],
         env={

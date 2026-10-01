@@ -481,9 +481,9 @@ if [ -t 0 ] && [ -t 1 ]; then
   INTERACTIVE=true
 fi
 NODE_DIR="${DEV_SANDBOX_NODE_DIR:-}"
-if [ -z "$NODE_DIR" ] && command -v node >/dev/null; then
-  NODE_DIR="$(dirname "$(dirname "$(command -v node)")")"
-fi
+# Only use an explicit header directory (the Nix wrapper supplies one).
+# Host Node may be hidden by the /usr/local mount or replaced by the installer;
+# otherwise node-gyp must fetch headers matching the Node running the build.
 WAYLAND_SOCKET=""
 if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
   && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
