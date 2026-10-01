@@ -1,4 +1,4 @@
-name: Sandbox Node CA E2E receipts
+name: Sandbox installer regression receipts
 on:
   push:
     branches: [ci/verify-sandbox-node-ca]
@@ -25,3 +25,20 @@ jobs:
     with:
       route: update
       install-ref: ${{ matrix.install-ref }}
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Prepare focused test environment
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -e . pytest pytest-asyncio pytest-timeout ruff
+      - name: Regression tests
+        run: scripts/run_tests.sh tests/test_dev_sandbox_node_tls.py tests/test_install_sh_node_deps_failure.py tests/test_install_sh_node_npm_check.py tests/test_install_sh_browser_install.py --file-retries 0 -v
+      - name: Lint and shell checks
+        run: |
+          .venv/bin/ruff check tests/test_dev_sandbox_node_tls.py
+          .venv/bin/ruff format --check tests/test_dev_sandbox_node_tls.py
+          bash -n scripts/dev-sandbox.sh scripts/sandbox/stage2-run.sh tests/install/install-update-e2e.sh
+          git diff --check
