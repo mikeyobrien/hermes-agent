@@ -1,0 +1,27 @@
+name: Sandbox Node CA E2E receipts
+on:
+  push:
+    branches: [ci/verify-sandbox-node-ca]
+permissions:
+  contents: read
+jobs:
+  installer:
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        install-ref: [v2026.3.12, v2026.3.23, v2026.3.30, v2026.4.8, v2026.4.16]
+    uses: ./.github/workflows/install-e2e-run.yml
+    with:
+      route: installer
+      install-ref: ${{ matrix.install-ref }}
+  update:
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        install-ref: [v2026.3.12, v2026.3.23, v2026.3.30, v2026.4.8, v2026.4.16]
+    uses: ./.github/workflows/install-e2e-run.yml
+    with:
+      route: update
+      install-ref: ${{ matrix.install-ref }}
