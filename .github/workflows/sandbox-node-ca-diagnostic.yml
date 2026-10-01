@@ -1,0 +1,39 @@
+name: Sandbox installer diagnostic receipt
+on:
+  push:
+    branches: [ci/diagnose-sandbox-node-ca]
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+      - name: Prepare sandbox
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap slirp4netns uidmap util-linux
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Installer E2E
+        run: tests/install/install-update-e2e.sh --route installer --install-ref v2026.3.23 --keep
+        env:
+          HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
+      - name: npm diagnostics
+        if: always()
+        run: |
+          root=.hermes-sandbox-e2e-installer
+          if [ -d "$root/home/.npm/_logs" ]; then
+            cp -a "$root/home/.npm/_logs" "${{ runner.temp }}/e2e-logs/npm-debug"
+            for log in "$root/home/.npm/_logs/"*; do
+              echo "$log"
+              tail -n 120 "$log"
+            done
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: sandbox-installer-diagnostics
+          path: ${{ runner.temp }}/e2e-logs
