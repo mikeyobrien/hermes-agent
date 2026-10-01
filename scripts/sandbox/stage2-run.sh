@@ -47,7 +47,13 @@ if [ "$home_parent" != / ]; then
 fi
 home_mounts+=(--bind "$DEV_SANDBOX_ROOT/home" "$DEV_SANDBOX_HOME")
 
-node_env=()
+# Node does not use SSL_CERT_FILE: npm must also trust the CA signing the
+# proxy's certificates. Keep the real roots for Node clients that connect
+# directly, and leave the proxy's upstream-only trust bundle unchanged.
+cat "$DEV_SANDBOX_ROOT/root/certs/real-ca.pem" \
+  "$DEV_SANDBOX_ROOT/root/certs/ca.pem" \
+  > "$DEV_SANDBOX_ROOT/root/certs/node-ca.pem"
+node_env=(--setenv NODE_EXTRA_CA_CERTS /work/certs/node-ca.pem)
 if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
   node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
 fi
@@ -216,7 +222,6 @@ exec bwrap \
   --setenv CURL_CA_BUNDLE /work/certs/ca.pem \
   --setenv SSL_CERT_FILE /work/certs/ca.pem \
   --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
-  --setenv NODE_EXTRA_CA_CERTS /work/certs/real-ca.pem \
   --setenv OPENSSL_CONF /work/certs/openssl.cnf \
   --setenv HTTP_PROXY http://127.0.0.1:8080 \
   --setenv HTTPS_PROXY http://127.0.0.1:8080 \
